@@ -15,6 +15,7 @@ import tensorflow as tf
 import tensorflow_datasets as tfds
 
 import models
+import modules
 import utils
 
 from tqdm.auto import tqdm
@@ -28,52 +29,92 @@ flags.DEFINE_integer("eval_frequency", 100, "How often to evaluate the model.")
 flags.DEFINE_integer("random_seed", 42, "Random seed.")
 flags.DEFINE_integer("em_steps", 20, "Number of steps for Euler-Maruyama (during training)")
 flags.DEFINE_integer("em_steps_test", 100, "Number of Euler-Maruyama steps on test")
-flags.DEFINE_integer("hidden_size", 512, "Number of neurons in hidden layers of MLPs")
 flags.DEFINE_integer("latent_size", 10, "Latent variable dimension")
-flags.DEFINE_float("gamma", 0.1, "\sqrt{\gamma} for the diffusion coefficient")
+flags.DEFINE_float("sqrt_gamma", 0.1, "\sqrt{\gamma} for the diffusion coefficient")
 flags.DEFINE_enum("likelihood", models.BERNOULLI, models.LIKELIHOODS, "Likelihood to use in the model")
+flags.DEFINE_enum("dataset", utils.MNIST, utils.DATASETS, "Dataset to use")
+flags.DEFINE_string("outdir", None, "Output directory")
 
 FLAGS = flags.FLAGS
+
 
 def main(_):
 
     binarize = FLAGS.likelihood == models.BERNOULLI
 
-    train_data = utils.load_dataset("train", shuffle=True, batch_size=FLAGS.batch_size, binarize=binarize)
-    test_data = utils.load_dataset("test", shuffle=False, batch_size=FLAGS.batch_size, binarize=binarize)
+    train_data = utils.load_dataset("train", shuffle=True, batch_size=FLAGS.batch_size, binarize=binarize, dataset=FLAGS.dataset)
+    test_data = utils.load_dataset("test", shuffle=False, batch_size=FLAGS.batch_size, binarize=binarize, dataset=FLAGS.dataset)
 
-    model_args = (FLAGS.gamma**2, FLAGS.hidden_size, FLAGS.latent_size, FLAGS.likelihood)
-    loss_fn = hk.transform(lambda y : models.DiffusionVAE(*model_args).relative_entropy_control_cost(y, FLAGS.em_steps))
-    sample_fn = hk.transform(lambda n : models.DiffusionVAE(*model_args).sample(n, FLAGS.em_steps_test))
+    def build_model():
+
+        if FLAGS.dataset == utils.MNIST:
+            data_encoder=modules.MNIST_CNN_Encoder(FLAGS.latent_size)
+            decoder = modules.MNIST_CNN_Decoder()
+        elif FLAGS.dataset == utils.CELEBA:
+            data_encoder=modules.CELEBA_CNN_Encoder(FLAGS.latent_size)
+            decoder = modules.CELEBA_CNN_Decoder()
+
+
+        control_drift = modules.AmortizedDrift(
+                encoder=modules.Encoder(FLAGS.latent_size, [512, 512]),
+                data_encoder=data_encoder,
+        )
+        
+        model_drift = modules.Drift(
+                encoder=modules.Encoder(FLAGS.latent_size, [512, 512]),
+        )
+
+        model = models.DiffusionVAE(
+                latent_size=FLAGS.latent_size,
+                control_drift=control_drift,
+                model_drift=model_drift,
+                decoder=decoder,
+                gamma=FLAGS.sqrt_gamma**2,
+                likelihood=FLAGS.likelihood,
+        )
+
+        return model
+
+    loss_fn = hk.transform_with_state(lambda y : build_model().relative_entropy_control_cost(y, FLAGS.em_steps, True))
+    sample_fn = hk.transform_with_state(lambda n : build_model().sample(n, FLAGS.em_steps_test))
 
     rng_seq = hk.PRNGSequence(FLAGS.random_seed)
-    params = loss_fn.init(next(rng_seq), next(train_data))
+    params, state = loss_fn.init(next(rng_seq), next(train_data))
 
     opt = optax.adam(FLAGS.learning_rate)
     opt_state = opt.init(params)
 
     @jax.jit
-    def update(rng, params, opt_state, y):
-        loss, grads = jax.value_and_grad(loss_fn.apply)(params, rng, y)
+    def update(rng, params, state, opt_state, y):
+        (loss, new_state), grads = jax.value_and_grad(loss_fn.apply, has_aux=True)(params, state, rng, y)
         updates, opt_state = opt.update(grads, opt_state)
         new_params = optax.apply_updates(params, updates)
-        return new_params, opt_state, loss
+        return new_params, new_state, opt_state, loss
 
 
     train_losses = []
+
     for i in tqdm(range(FLAGS.training_steps)):
-        params, opt_state, loss = update(next(rng_seq), params, opt_state, next(train_data))
+        params, state, opt_state, loss = update(next(rng_seq), params, state, opt_state, next(train_data))
         train_losses.append(loss)
 
-        if (i + 1) % FLAGS.eval_frequency == 0:
-            sampled_images = utils.image_sample(next(rng_seq), sample_fn, params, 10, 10)
-            plt.imsave("samples.png", sampled_images, cmap=plt.cm.gray)
+        if FLAGS.outdir is not None:
+            if (i + 1) % FLAGS.eval_frequency == 0:
+                nth_sample = (i + 1) // FLAGS.eval_frequency
+                sampled_images, _ = sample_fn.apply(params, state, next(rng_seq), 100)
+                sampled_images = utils.image_grid(10, 10, sampled_images)
 
-    train_losses = jnp.array(train_losses)
+                if sampled_images.shape[-1] == 1:
+                    sampled_images = sampled_images[:, :, 0]
 
-    plt.plot(train_losses)
-    plt.ylim(70, 150)
-    plt.savefig("losses.png")
+                plt.imsave(FLAGS.outdir + "/sample-{}.png".format(nth_sample), sampled_images, cmap=plt.cm.gray)
+
+                jnp.save(FLAGS.outdir + "/params.npy", params)
+                jnp.save(FLAGS.outdir + "/state.npy", state)
+
+                plt.plot(jnp.array(train_losses))
+                plt.savefig(FLAGS.outdir + "/losses.png")
+                plt.close()
 
 if __name__ == "__main__":
     app.run(main)
