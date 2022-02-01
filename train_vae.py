@@ -26,6 +26,7 @@ flags.DEFINE_integer("random_seed", 42, "Random seed.")
 flags.DEFINE_integer("latent_size", 10, "Latent variable dimension")
 flags.DEFINE_enum("likelihood", models.BERNOULLI, models.LIKELIHOODS, "Likelihood to use in the model")
 flags.DEFINE_enum("dataset", utils.MNIST, utils.DATASETS, "Dataset to use")
+flags.DEFINE_string("outdir", None, "Output directory")
 
 FLAGS = flags.FLAGS
 
@@ -88,13 +89,23 @@ def main(_):
         train_losses.append(loss)
 
         if (i + 1) % FLAGS.eval_frequency == 0:
+            nth_sample = (i + 1) // FLAGS.eval_frequency
             sampled_images, _ = sample_fn.apply(params, state, next(rng_seq), 100)
             sampled_images = utils.image_grid(10, 10, sampled_images)
 
             if sampled_images.shape[-1] == 1:
                 sampled_images = sampled_images[:, :, 0]
 
-            plt.imsave("samples.png", sampled_images, cmap=plt.cm.gray)
+            plt.imsave(FLAGS.outdir + f"/sample-{nth_sample:03d}.png", sampled_images, cmap=plt.cm.gray)
+
+            jnp.save(FLAGS.outdir + "/params.npy", params)
+            jnp.save(FLAGS.outdir + "/state.npy", state)
+            jnp.save(FLAGS.outdir + "/losses.npy", jnp.array(train_losses))
+
+
+            plt.plot(jnp.array(train_losses))
+            plt.savefig(FLAGS.outdir + "/losses.png")
+            plt.close()
 
     train_losses = jnp.array(train_losses)
 

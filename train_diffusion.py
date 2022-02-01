@@ -14,9 +14,7 @@ import matplotlib.pyplot as plt
 import tensorflow as tf
 import tensorflow_datasets as tfds
 
-import models
-import modules
-import utils
+from src import models, modules, utils
 
 from tqdm.auto import tqdm
 
@@ -31,52 +29,65 @@ flags.DEFINE_integer("em_steps", 20, "Number of steps for Euler-Maruyama (during
 flags.DEFINE_integer("em_steps_test", 100, "Number of Euler-Maruyama steps on test")
 flags.DEFINE_integer("latent_size", 10, "Latent variable dimension")
 flags.DEFINE_float("sqrt_gamma", 0.1, "\sqrt{\gamma} for the diffusion coefficient")
-flags.DEFINE_enum("likelihood", models.BERNOULLI, models.LIKELIHOODS, "Likelihood to use in the model")
+flags.DEFINE_enum("likelihood", utils.BERNOULLI, utils.LIKELIHOODS, "Likelihood to use in the model")
 flags.DEFINE_enum("dataset", utils.MNIST, utils.DATASETS, "Dataset to use")
 flags.DEFINE_string("outdir", None, "Output directory")
 
 FLAGS = flags.FLAGS
 
+def build_model():
+
+    if FLAGS.dataset == utils.MNIST:
+        data_encoder=modules.MNIST_CNN_Encoder(FLAGS.latent_size)
+        decoder = modules.MNIST_ODE_Decoder()
+    elif FLAGS.dataset == utils.CELEBA:
+        data_encoder=modules.CELEBA_CNN_Encoder(FLAGS.latent_size)
+        decoder = modules.CELEBA_ODE_Decoder()
+        # decoder = modules.CELEBA_CNN_Decoder()
+
+
+    control_drift = modules.AmortizedDrift(
+            encoder=modules.Encoder(FLAGS.latent_size, [512, 512]),
+            data_encoder=data_encoder,
+    )
+    
+    model_drift = modules.Drift(
+            encoder=modules.Encoder(FLAGS.latent_size, [512, 512]),
+    )
+
+    model = models.DiffusionVAE(
+            latent_size=FLAGS.latent_size,
+            control_drift=control_drift,
+            model_drift=model_drift,
+            decoder=decoder,
+            gamma=FLAGS.sqrt_gamma**2,
+            likelihood=FLAGS.likelihood,
+    )
+
+    return model
+
+def compute_loss(y):
+    model = build_model()
+    loss = model.relative_entropy_control_cost(y, FLAGS.em_steps, True)
+    return loss
+
+def sample_images(n):
+    model = build_model()
+    samples, _ = model.sample(
+            batch_size=n, 
+            n_steps=FLAGS.em_steps_test,
+            apply_sigmoid=True,
+            )
+    return samples
 
 def main(_):
-
-    binarize = FLAGS.likelihood == models.BERNOULLI
+    binarize = FLAGS.likelihood == utils.BERNOULLI
 
     train_data = utils.load_dataset("train", shuffle=True, batch_size=FLAGS.batch_size, binarize=binarize, dataset=FLAGS.dataset)
     test_data = utils.load_dataset("test", shuffle=False, batch_size=FLAGS.batch_size, binarize=binarize, dataset=FLAGS.dataset)
 
-    def build_model():
-
-        if FLAGS.dataset == utils.MNIST:
-            data_encoder=modules.MNIST_CNN_Encoder(FLAGS.latent_size)
-            decoder = modules.MNIST_CNN_Decoder()
-        elif FLAGS.dataset == utils.CELEBA:
-            data_encoder=modules.CELEBA_CNN_Encoder(FLAGS.latent_size)
-            decoder = modules.CELEBA_CNN_Decoder()
-
-
-        control_drift = modules.AmortizedDrift(
-                encoder=modules.Encoder(FLAGS.latent_size, [512, 512]),
-                data_encoder=data_encoder,
-        )
-        
-        model_drift = modules.Drift(
-                encoder=modules.Encoder(FLAGS.latent_size, [512, 512]),
-        )
-
-        model = models.DiffusionVAE(
-                latent_size=FLAGS.latent_size,
-                control_drift=control_drift,
-                model_drift=model_drift,
-                decoder=decoder,
-                gamma=FLAGS.sqrt_gamma**2,
-                likelihood=FLAGS.likelihood,
-        )
-
-        return model
-
-    loss_fn = hk.transform_with_state(lambda y : build_model().relative_entropy_control_cost(y, FLAGS.em_steps, True))
-    sample_fn = hk.transform_with_state(lambda n : build_model().sample(n, FLAGS.em_steps_test))
+    loss_fn = hk.transform_with_state(compute_loss)
+    sample_fn = hk.transform_with_state(sample_images)
 
     rng_seq = hk.PRNGSequence(FLAGS.random_seed)
     params, state = loss_fn.init(next(rng_seq), next(train_data))
@@ -104,13 +115,16 @@ def main(_):
                 sampled_images, _ = sample_fn.apply(params, state, next(rng_seq), 100)
                 sampled_images = utils.image_grid(10, 10, sampled_images)
 
+
                 if sampled_images.shape[-1] == 1:
                     sampled_images = sampled_images[:, :, 0]
 
-                plt.imsave(FLAGS.outdir + "/sample-{}.png".format(nth_sample), sampled_images, cmap=plt.cm.gray)
+                plt.imsave(FLAGS.outdir + f"/sample-{nth_sample:03d}.png", sampled_images, cmap=plt.cm.gray)
 
                 jnp.save(FLAGS.outdir + "/params.npy", params)
                 jnp.save(FLAGS.outdir + "/state.npy", state)
+                jnp.save(FLAGS.outdir + "/losses.npy", jnp.array(train_losses))
+
 
                 plt.plot(jnp.array(train_losses))
                 plt.savefig(FLAGS.outdir + "/losses.png")
