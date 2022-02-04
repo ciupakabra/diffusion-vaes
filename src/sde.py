@@ -18,21 +18,18 @@ def euler_maruyama(
 
     dt = 1 / n_steps
 
-    def em_step(carry, t):
-        rng, x_t = carry
-        rng, subrng = jax.random.split(rng)
+    noise_terms = jax.random.normal(rng, (n_steps,) + x_0.shape)
 
-        noise_term = jax.random.normal(subrng, x_t.shape)
-        drift, diff, extras = drift_diff_func(x_t, t)
+    def em_step(x_i, val):
+        noise_term, t = val
 
-        x_t_ = x_t + dt * drift + jnp.sqrt(dt) * diff * noise_term
+        drift, diff, extras = drift_diff_func(x_i, t)
+        x_j = x_i + dt * drift + jnp.sqrt(dt) * diff * noise_term
 
-        return (rng, x_t_), extras
+        return x_j, extras
 
     ts = jnp.linspace(0, 1, n_steps + 1)
-    carry_0 = (rng, x_0)
-
-    (_, x_1), extras = hk.scan(em_step, carry_0, ts[:-1])
+    x_1, extras = hk.scan(em_step, x_0, (noise_terms, ts[:-1]))
 
     return x_1, extras
 
@@ -50,6 +47,6 @@ def ula(
         x_j = x_i - step_size * grad_U(x_i) + jnp.sqrt(2 * step_size) * noise_term
         return x_j, None
 
-    x_last, _ = hk.scan(ula_step, x_0, noise_terms)
+    x_last, _ = jax.lax.scan(ula_step, x_0, noise_terms)
 
     return x_last

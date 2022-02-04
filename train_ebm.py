@@ -11,6 +11,8 @@ import matplotlib.pyplot as plt
 
 import tensorflow as tf
 
+import pickle
+
 from src import utils
 from src import modules
 from src import models
@@ -44,13 +46,14 @@ FLAGS = flags.FLAGS
 
 def build_model():
     potential = modules.MNIST_CNN_Encoder(1)
+    # potential = hk.nets.ResNet18(1)
     return potential
 
 def loss(y_pos, y_neg):
     potential = build_model()
 
     y = jnp.concatenate([y_pos, y_neg])
-    E = potential(y, False)
+    E = potential(y, True)
     E_pos, E_neg = jnp.split(E, 2)
 
     cdiv_loss = (jnp.mean(E_pos) - jnp.mean(E_neg))
@@ -88,13 +91,21 @@ def main(_):
     file_writer = tf.summary.create_file_writer(logdir + "/metrics")
     file_writer.set_as_default()
 
-    loss_fn = hk.transform(loss)
-    sample_fn = hk.transform(sample)
-    sample_fn = jax.jit(sample_fn.apply, static_argnums=(3,))
+    # loss_fn = hk.transform(loss)
+    loss_fn = hk.transform_with_state(loss)
+    sample_fn = hk.transform_with_state(sample)
+    # sample_fn = jax.jit(sample_fn.apply, static_argnums=(3,))
+    sample_fn = jax.jit(sample_fn.apply, static_argnums=(4,))
+
 
     rng_seq = hk.PRNGSequence(FLAGS.random_seed)
 
-    params = loss_fn.init(next(rng_seq), next(train_data), next(train_data))
+    # params = loss_fn.init(next(rng_seq), next(train_data), next(train_data))
+    params, state = loss_fn.init(next(rng_seq), next(train_data), next(train_data))
+
+    sn_fn = hk.transform_with_state(lambda p : hk.SNParamsTree(n_steps=10, ignore_regex=".*\/b$")(p))
+    sn_fn = hk.without_apply_rng(sn_fn)
+    _, sn_state = sn_fn.init(next(rng_seq), params)
 
     opt = optax.adamw(FLAGS.learning_rate, weight_decay=0.1)
     opt_state = opt.init(params)
@@ -103,13 +114,18 @@ def main(_):
         rb = replay_buffer.create(FLAGS.replay_capacity, (28, 28, 1))
         rb = replay_buffer.store(rb, jax.random.uniform(next(rng_seq), (FLAGS.neg_batch_size, 28, 28, 1)))
 
+    def loss_func(params, state, rng, y_pos, y_neg):
+        (loss, metrics), state = loss_fn.apply(params, state, rng, y_pos, y_neg)
+        return loss, (metrics, state)
+
     @jax.jit
-    def update(rng, params, y_pos, y_neg, opt_state):
-        (_, metrics), grads = jax.value_and_grad(loss_fn.apply, has_aux=True)(params, rng, y_pos, y_neg)
+    def update(rng, params, y_pos, y_neg, opt_state, state, sn_state):
+        (_, (metrics, state)), grads = jax.value_and_grad(loss_func, has_aux=True)(params, state, rng, y_pos, y_neg)
 
         updates, opt_state = opt.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
-        return new_params, opt_state, metrics
+        # new_params, new_sn_state = sn_fn.apply(None, sn_state, new_params)
+        return new_params, opt_state, metrics, state, None
 
     for i in tqdm(range(FLAGS.training_steps)):
 
@@ -118,15 +134,18 @@ def main(_):
         else:
             y_neg = jax.random.uniform(next(rng_seq), (FLAGS.neg_batch_size,) + (28, 28, 1))
             
-        y_neg = sample_fn(params, next(rng_seq), y_neg, FLAGS.ula_steps)
+        y_neg, _ = sample_fn(params, state, next(rng_seq), y_neg, FLAGS.ula_steps)
         y_pos = next(train_data)
 
-        params, opt_state, metrics = update(
+        params, opt_state, metrics, state, sn_state = update(
                 next(rng_seq),
                 params,
                 y_pos,
                 y_neg,
-                opt_state,)
+                opt_state,
+                state,
+                sn_state,
+                )
 
         for k, v in metrics.items():
             tf.summary.scalar("train_metrics/" + k, data=v, step=i)
@@ -142,7 +161,7 @@ def main(_):
                 nth_sample = (i + 1) // FLAGS.eval_frequency
 
                 sampled_images = jax.random.uniform(next(rng_seq), (100, 28, 28, 1))
-                sampled_images = sample_fn(params, next(rng_seq), sampled_images, 500)
+                sampled_images, _ = sample_fn(params, state, next(rng_seq), sampled_images, 500)
                 sampled_images = utils.image_grid(10, 10, sampled_images)
                 sampled_images = jax.lax.clamp(0.0, sampled_images, 1.0)
                 sampled_images = sampled_images[None, ...]
@@ -155,6 +174,11 @@ def main(_):
                     buffer_images = buffer_images[None, ...]
                     tf.summary.image("samples/buffer", data=buffer_images, step=i)
 
+                
+                with open(FLAGS.outdir + "/params.npy", "wb") as f:
+                    pickle.dump(params, f)
+                with open(FLAGS.outdir + "/state.npy", "wb") as f:
+                    pickle.dump(state, f)
 
 if __name__ == "__main__":
     app.run(main)

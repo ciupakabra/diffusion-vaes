@@ -24,7 +24,7 @@ class Drift(hk.Module):
             ) -> jnp.ndarray:
         t = t * jnp.ones(x.shape[:-1])[..., None]
         inp = jnp.concatenate((x, t), axis=-1)
-        return self.encoder(inp, is_training)
+        return self.encoder(inp)
 
 class AmortizedDrift(Drift):
     """ Drift that also depends on data and can be used as amortized VI """
